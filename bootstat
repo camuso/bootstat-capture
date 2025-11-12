@@ -1,0 +1,553 @@
+#!/bin/bash
+#
+# bootstat
+#
+
+[ -n "$MYDIR" ] || {
+	declare MYDIR=
+	MYDIR="$(dirname "$(readlink -f "$0")")"
+}
+
+declare usagestr="$(
+cat <<EOF
+
+$(basename "$0") [-v|--verbose]
+
+Options:
+  -v, --verbose    Print detailed stack traces and panics with timestamps
+
+EOF
+)"
+
+declare b_verbose=false
+
+#** usage: print info and instructions to screen
+#
+# Global
+# 	usagestr
+#*
+usage() {
+	echo -e "$usagestr"
+}
+
+#** control_c: control-c trap
+#
+# Global
+#   CTLC_EXIT - bash environment variable
+#*
+control_c() {
+	echo -e "\nCtrl-c detected\nCleaning up and exiting."
+	exit $CTLC_EXIT
+}
+
+#** exitme
+#
+# Arguments
+#   $1 - exit code
+#   $2 - optional message
+#*
+exitme() {
+	local -i code="$1"
+	local msg="$2"
+
+	((code == 0)) && exit "$code"
+	echo -e "$msg"
+	usage
+	exit "$code"
+}
+
+#** check_kernel_logs: Check kernel logs for stack traces, Oops, Panic
+#*
+check_kernel_logs() {
+	local last_boot="$1"
+	local found_traces=false
+	# Very specific patterns: only actual stack traces, Oops, panics, bugs
+	# Must start with kernel: prefix or be in kernel log context
+	local trace_pattern="(Call Trace:|Oops:|Kernel panic|kernel BUG|BUG at|BUG:|stack backtrace|general protection fault|page fault|NULL pointer dereference)"
+
+	# Check dmesg for stack traces (current boot only)
+	if command -v dmesg >/dev/null 2>&1; then
+		local dmesg_output
+		dmesg_output=$(dmesg -T 2>/dev/null | grep -iE "$trace_pattern")
+		if [[ -n "$dmesg_output" ]]; then
+			found_traces=true
+			if [[ "$b_verbose" == "true" ]]; then
+				echo "  Kernel messages (dmesg - current boot):"
+				# Only show lines that match pattern or are stack trace continuation lines
+				dmesg -T 2>/dev/null | awk -v pattern="$trace_pattern" '
+					BEGIN { in_trace = 0 }
+					/'"$trace_pattern"'/i { in_trace = 1; print; next }
+					in_trace && /^[[:space:]]*[0-9a-fA-F]+/ { print; next }
+					in_trace && /^[[:space:]]+[?#]/ { print; next }
+					in_trace && /^[[:space:]]*RIP:|^[[:space:]]*Code:|^[[:space:]]*---\[ end trace/ { print; next }
+					{ in_trace = 0 }
+				' | sed 's/^/    /'
+			fi
+		fi
+	fi
+
+	# Check journalctl for kernel messages with stack traces (current boot only)
+	if command -v journalctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+		# Use -b 0 to only show current boot, -k for kernel messages only
+		# journalctl -k already filters to kernel messages only
+		local journal_output
+		journal_output=$(journalctl -k -b 0 --no-pager 2>/dev/null | \
+		   grep -iE "$trace_pattern")
+		if [[ -n "$journal_output" ]]; then
+			found_traces=true
+			if [[ "$b_verbose" == "true" ]]; then
+				echo "  Kernel messages (journalctl - current boot):"
+				# Only show lines that match pattern - no context to avoid unrelated entries
+				journalctl -k -b 0 --no-pager 2>/dev/null | \
+				   grep -iE "$trace_pattern" | \
+				   sed 's/^/    /'
+			fi
+		fi
+	fi
+
+	# Check traditional log files (if they were modified since last boot)
+	for logfile in /var/log/kern.log /var/log/messages /var/log/syslog; do
+		if [[ -f "$logfile" ]] && [[ -r "$logfile" ]]; then
+			# Check if file was modified after last boot using find
+			if find "$logfile" -newermt "$last_boot" 2>/dev/null | grep -q .; then
+				# Only check kernel messages (lines containing "kernel:")
+				local log_output
+				log_output=$(grep -iE "kernel:.*$trace_pattern" "$logfile" 2>/dev/null)
+				if [[ -n "$log_output" ]]; then
+					found_traces=true
+					if [[ "$b_verbose" == "true" ]]; then
+						echo "  Kernel messages ($logfile - since last boot):"
+						# Only show kernel messages that match pattern or are stack trace continuation
+						grep -iE "kernel:.*$trace_pattern" "$logfile" 2>/dev/null | \
+						   awk -v pattern="$trace_pattern" '
+							BEGIN { in_trace = 0 }
+							/kernel:/ && /'"$trace_pattern"'/i { in_trace = 1; print; next }
+							in_trace && /kernel:/ && /^[[:space:]]*[0-9a-fA-F]+/ { print; next }
+							in_trace && /kernel:/ && /^[[:space:]]+[?#]/ { print; next }
+							in_trace && /kernel:/ && /RIP:|Code:|---\[ end trace/ { print; next }
+							{ in_trace = 0 }
+						   ' | sed 's/^/    /'
+					fi
+					break
+				fi
+			fi
+		fi
+	done
+
+	if [[ "$found_traces" == "true" ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+#** check_shutdown_errors: Check for errors during shutdown
+#*
+check_shutdown_errors() {
+	local last_boot="$1"
+	local found_errors=false
+	# More specific patterns: actual stack traces, panics, segfaults - not just any message
+	local trace_pattern="(Call Trace:|Oops:|Kernel panic|kernel BUG|BUG at|BUG:|stack backtrace|segfault|general protection fault|page fault|NULL pointer dereference)"
+
+	# Check for shutdown-related stack traces
+	# Since there may be no persistent journal, check multiple sources
+	
+	# First, check if journalctl has persistent data
+	local has_persistent_journal=false
+	if command -v journalctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+		if journalctl --list-boots 2>/dev/null | grep -q "^-"; then
+			has_persistent_journal=true
+		fi
+	fi
+	
+	local prev_boot_traces=""
+	local shutdown_window_traces=""
+	local explicit_shutdown_traces=""
+	local log_file_traces=""
+	local dmesg_reboot_traces=""
+	local saved_shutdown_traces=""
+	
+	# Check for saved shutdown traces from shutdown-capture script
+	local shutdown_log_dir="/var/log/shutdown-traces"
+	if [[ -d "$shutdown_log_dir" ]]; then
+		# Find the most recent shutdown trace file
+		local latest_trace
+		latest_trace=$(find "$shutdown_log_dir" -name "shutdown-*.log" -type f -printf '%T@ %p\n' 2>/dev/null | \
+			sort -rn | head -1 | cut -d' ' -f2-)
+		if [[ -n "$latest_trace" ]] && [[ -f "$latest_trace" ]] && [[ -r "$latest_trace" ]]; then
+			# Check if this trace file is from before current boot or very recent (from current shutdown)
+			local trace_mtime
+			trace_mtime=$(stat -c %Y "$latest_trace" 2>/dev/null || echo "0")
+			local boot_time_epoch
+			boot_time_epoch=$(date -d "$last_boot" +%s 2>/dev/null || echo "0")
+			local current_time
+			current_time=$(date +%s 2>/dev/null || echo "0")
+			# Check if file is from previous shutdown OR from very recent shutdown (within last hour)
+			# This handles cases where shutdown-capture runs during current shutdown
+			if [[ "$trace_mtime" -lt "$boot_time_epoch" ]] || [[ "$boot_time_epoch" -eq "0" ]] || \
+			   [[ $((current_time - trace_mtime)) -lt 3600 ]]; then
+				# Check if file has trace patterns
+				local has_traces
+				has_traces=$(grep -iE "$trace_pattern" "$latest_trace" 2>/dev/null | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -1)
+				if [[ -n "$has_traces" ]]; then
+					# Found traces in saved file - mark as found
+					saved_shutdown_traces="found"
+					# For verbose mode, extract the actual traces
+					if [[ "$b_verbose" == "true" ]]; then
+						# Check for "reboot: Restarting" or "reboot: machine restart" specifically
+						local has_reboot_context
+						has_reboot_context=$(grep -iE "(reboot:.*Restarting|reboot:.*machine.*restart|Comm:.*reboot|reboot|machine_emergency_restart|tboot_shutdown|do_syscall.*reboot|shutdown|halt)" "$latest_trace" 2>/dev/null | head -1)
+						if [[ -n "$has_reboot_context" ]]; then
+							# Has reboot context, get full trace blocks with wider context
+							saved_shutdown_traces=$(awk -v pattern="$trace_pattern" '
+								{
+									lines[NR] = $0
+								}
+								END {
+									max_lines = NR
+									last_printed = 0
+									for (i = 1; i <= max_lines; i++) {
+										if (lines[i] ~ pattern && lines[i] !~ /\[Firmware Bug\]|Firmware Bug:/ && i > last_printed) {
+											start = (i - 50 > 1) ? i - 50 : 1
+											end = (i + 100 < max_lines) ? i + 100 : max_lines
+											has_reboot = 0
+											block = ""
+											for (j = start; j <= end; j++) {
+												block = block lines[j] "\n"
+												if (lines[j] ~ /reboot:.*Restarting|reboot:.*machine.*restart|Comm:.*reboot|reboot|machine_emergency_restart|tboot_shutdown|do_syscall.*reboot|shutdown|halt/i) {
+													has_reboot = 1
+												}
+											}
+											if (has_reboot || i <= 50) {
+												print block
+												last_printed = end
+											}
+										}
+									}
+								}
+							' "$latest_trace" 2>/dev/null)
+						else
+							# No explicit reboot context, but it's from shutdown-capture so show traces anyway
+							saved_shutdown_traces=$(grep -iEA 50 "$trace_pattern" "$latest_trace" 2>/dev/null | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -150)
+						fi
+					fi
+				fi
+			fi
+		fi
+	fi
+	
+	# Check boot-capture log files (dmesg captured immediately on boot)
+	# These capture dmesg before it's cleared, so they may contain shutdown traces
+	local boot_log_dir="/var/log/shutdown-traces"
+	if [[ -d "$boot_log_dir" ]] && [[ -r "$boot_log_dir" ]]; then
+		local latest_boot_trace
+		latest_boot_trace=$(find "$boot_log_dir" -name "boot-capture-*.log" -type f -printf '%T@ %p\n' 2>/dev/null | \
+			sort -rn | head -1 | cut -d' ' -f2-)
+		if [[ -n "$latest_boot_trace" ]] && [[ -f "$latest_boot_trace" ]] && [[ -r "$latest_boot_trace" ]]; then
+			# Check if this trace file is from current boot (should be very recent)
+			local trace_mtime
+			trace_mtime=$(stat -c %Y "$latest_boot_trace" 2>/dev/null || echo "0")
+			local boot_time_epoch
+			boot_time_epoch=$(date -d "$last_boot" +%s 2>/dev/null || echo "0")
+			# Boot-capture runs early, so check if it's from after boot time (within last hour)
+			local current_time
+			current_time=$(date +%s 2>/dev/null || echo "0")
+			if [[ "$trace_mtime" -ge "$boot_time_epoch" ]] && [[ $((current_time - trace_mtime)) -lt 3600 ]]; then
+				# Check if file has trace patterns
+				local has_traces
+				has_traces=$(grep -iE "$trace_pattern" "$latest_boot_trace" 2>/dev/null | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -1)
+				if [[ -n "$has_traces" ]]; then
+					# Found traces in boot-capture file
+					if [[ -z "$saved_shutdown_traces" ]] || [[ "$saved_shutdown_traces" == "found" ]]; then
+						saved_shutdown_traces="found"
+					fi
+					# For verbose mode, extract the actual traces
+					if [[ "$b_verbose" == "true" ]]; then
+						if [[ "$saved_shutdown_traces" == "found" ]]; then
+							saved_shutdown_traces=""
+						fi
+						saved_shutdown_traces="${saved_shutdown_traces}${saved_shutdown_traces:+$'\n'}=== Boot-capture traces (from previous shutdown) ===${saved_shutdown_traces:+$'\n'}$(grep -iEA 50 "$trace_pattern" "$latest_boot_trace" 2>/dev/null | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -150)"
+					fi
+				fi
+			fi
+		fi
+	fi
+	
+	if [[ "$has_persistent_journal" == "true" ]]; then
+		# Check previous boot if persistent journal exists
+		prev_boot_traces=$(journalctl -k -b -1 --no-pager 2>/dev/null | \
+		   grep -iE "$trace_pattern")
+		
+		# Check shutdown window
+		if [[ -n "$last_boot" ]]; then
+			local shutdown_start
+			shutdown_start=$(date -d "$last_boot -10 minutes" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+			if [[ -n "$shutdown_start" ]]; then
+				shutdown_window_traces=$(journalctl -k --since "$shutdown_start" --until "$last_boot" --no-pager 2>/dev/null | \
+				   grep -iE "$trace_pattern")
+			fi
+		fi
+		
+		# Check explicit shutdown patterns
+		local shutdown_pattern="($trace_pattern).*(shutdown|halt|reboot|poweroff|stopping|Stopping|Stopped)|(shutdown|halt|reboot|poweroff|stopping|Stopping|Stopped).*($trace_pattern)"
+		explicit_shutdown_traces=$(journalctl -k -b -1 --no-pager 2>/dev/null | \
+		   grep -iE "$shutdown_pattern")
+	fi
+	
+	# Check log files for traces that occurred before current boot
+	# Log files persist across boots, so they may contain shutdown traces
+	# The trace happens during reboot, so check for traces near reboot messages
+	for logfile in /var/log/kern.log /var/log/messages /var/log/syslog; do
+		if [[ -f "$logfile" ]] && [[ -r "$logfile" ]]; then
+			# Check if file has "reboot: Restarting" or "reboot: machine restart" messages
+			# These indicate reboot sequence - traces near them are shutdown-related
+			local has_reboot_msg
+			has_reboot_msg=$(grep -E "reboot: Restarting|reboot: machine restart" "$logfile" 2>/dev/null | head -1)
+			
+			if [[ -n "$has_reboot_msg" ]]; then
+				# Found reboot messages - look for traces within 100 lines of reboot messages
+				# Use awk to find traces near reboot messages
+				local file_traces
+				file_traces=$(awk -v pattern="$trace_pattern" '
+					BEGIN {
+						reboot_count = 0
+					}
+					{
+						lines[NR] = $0
+						# Track reboot message line numbers
+						if ($0 ~ /reboot: Restarting|reboot: machine restart/) {
+							reboot_lines[++reboot_count] = NR
+						}
+					}
+					END {
+						max_lines = NR
+						last_printed = 0
+						for (i = 1; i <= max_lines; i++) {
+							# Match trace pattern but exclude firmware bugs
+							if (lines[i] ~ pattern && lines[i] !~ /\[Firmware Bug\]|Firmware Bug:/ && i > last_printed) {
+								# Check if this trace is within 100 lines of any reboot message
+								near_reboot = 0
+								for (r = 1; r <= reboot_count; r++) {
+									reboot_line = reboot_lines[r]
+									if (i >= reboot_line - 100 && i <= reboot_line + 100) {
+										near_reboot = 1
+										break
+									}
+								}
+								
+								if (near_reboot) {
+									# Show context around trace (30 lines before, 70 lines after)
+									start = (i - 30 > 1) ? i - 30 : 1
+									end = (i + 70 < max_lines) ? i + 70 : max_lines
+									for (j = start; j <= end; j++) {
+										print lines[j]
+									}
+									print "---"
+									last_printed = end
+								}
+							}
+						}
+					}
+				' "$logfile" 2>/dev/null)
+				
+				if [[ -n "$file_traces" ]]; then
+					log_file_traces="${log_file_traces}${log_file_traces:+$'\n'}=== $logfile ===${log_file_traces:+$'\n'}$file_traces"
+				fi
+			else
+				# No reboot messages found, but check if file has traces with reboot context
+				local file_has_traces
+				file_has_traces=$(grep -iE "$trace_pattern" "$logfile" 2>/dev/null | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -1)
+				if [[ -n "$file_has_traces" ]]; then
+					local file_has_reboot
+					file_has_reboot=$(grep -iE "(reboot|shutdown|halt)" "$logfile" 2>/dev/null | head -1)
+					if [[ -n "$file_has_reboot" ]]; then
+						# Extract trace blocks with reboot context
+						local file_traces
+						file_traces=$(awk -v pattern="$trace_pattern" '
+							{
+								lines[NR] = $0
+							}
+							END {
+								max_lines = NR
+								last_printed = 0
+								for (i = 1; i <= max_lines; i++) {
+									if (lines[i] ~ pattern && lines[i] !~ /\[Firmware Bug\]|Firmware Bug:/ && i > last_printed) {
+										start = (i - 50 > 1) ? i - 50 : 1
+										end = (i + 50 < max_lines) ? i + 50 : max_lines
+										has_reboot = 0
+										block = ""
+										for (j = start; j <= end; j++) {
+											block = block lines[j] "\n"
+											if (lines[j] ~ /reboot|shutdown|halt/i) {
+												has_reboot = 1
+											}
+										}
+										if (has_reboot) {
+											print block
+											last_printed = end
+										}
+									}
+								}
+							}
+						' "$logfile" 2>/dev/null)
+						if [[ -n "$file_traces" ]]; then
+							log_file_traces="${log_file_traces}${log_file_traces:+$'\n'}=== $logfile ===${log_file_traces:+$'\n'}$file_traces"
+						fi
+					fi
+				fi
+			fi
+		fi
+	done
+	
+	# Check dmesg for traces with reboot context (current boot)
+	# Traces during reboot might still be in current boot's dmesg
+	# dmesg format: [timestamp] message (no "kernel:" prefix)
+	if command -v dmesg >/dev/null 2>&1; then
+		local dmesg_all
+		dmesg_all=$(dmesg -T 2>/dev/null || dmesg 2>/dev/null)
+		if [[ -n "$dmesg_all" ]]; then
+			# Check if dmesg has traces (excluding firmware bugs)
+			local dmesg_has_traces
+			dmesg_has_traces=$(echo "$dmesg_all" | grep -iE "$trace_pattern" | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -1)
+			# Check if dmesg has reboot messages
+			local dmesg_has_reboot
+			dmesg_has_reboot=$(echo "$dmesg_all" | grep -iE "(reboot: Restarting|reboot: machine restart|reboot:)" | head -1)
+			
+			# If both exist, extract all traces with their context
+			if [[ -n "$dmesg_has_traces" ]] && [[ -n "$dmesg_has_reboot" ]]; then
+				# Extract all trace blocks, checking for reboot context in wider window
+				# Use printf to safely pass the pattern to awk
+				dmesg_reboot_traces=$(echo "$dmesg_all" | \
+				   awk -v pattern="$trace_pattern" '
+					BEGIN {
+						reboot_count = 0
+					}
+					{
+						lines[NR] = $0
+						if ($0 ~ /reboot: Restarting|reboot: machine restart|reboot:/i) {
+							reboot_lines[++reboot_count] = NR
+						}
+					}
+					END {
+						max_lines = NR
+						last_printed = 0
+						for (i = 1; i <= max_lines; i++) {
+							if (lines[i] ~ pattern && lines[i] !~ /\[Firmware Bug\]|Firmware Bug:/ && i > last_printed) {
+								near_reboot = 0
+								for (r = 1; r <= reboot_count; r++) {
+									reboot_line = reboot_lines[r]
+									if (reboot_line > 0 && i >= reboot_line - 100 && i <= reboot_line + 100) {
+										near_reboot = 1
+										break
+									}
+								}
+								if (near_reboot) {
+									start = (i - 30 > 1) ? i - 30 : 1
+									end = (i + 70 < max_lines) ? i + 70 : max_lines
+									for (j = start; j <= end; j++) {
+										print lines[j]
+									}
+									print "---"
+									last_printed = end
+								}
+							}
+						}
+					}
+				   ')
+			fi
+		fi
+	fi
+	
+	# If we found any traces, mark as found
+	if [[ -n "$prev_boot_traces" ]] || [[ -n "$shutdown_window_traces" ]] || [[ -n "$explicit_shutdown_traces" ]] || \
+	   [[ -n "$log_file_traces" ]] || [[ -n "$dmesg_reboot_traces" ]] || [[ -n "$saved_shutdown_traces" ]]; then
+		found_errors=true
+		if [[ "$b_verbose" == "true" ]]; then
+			if [[ -n "$saved_shutdown_traces" ]]; then
+				echo "  Stack traces from previous shutdown (saved):"
+				echo "$saved_shutdown_traces" | sed 's/^/    /'
+			fi
+			if [[ -n "$prev_boot_traces" ]]; then
+				echo "  Stack traces from previous boot (journalctl):"
+				echo "$prev_boot_traces" | sed 's/^/    /'
+			fi
+			if [[ -n "$shutdown_window_traces" ]]; then
+				echo "  Stack traces during shutdown window (10 min before boot):"
+				echo "$shutdown_window_traces" | sed 's/^/    /'
+			fi
+			if [[ -n "$explicit_shutdown_traces" ]]; then
+				echo "  Explicit shutdown-related stack traces:"
+				echo "$explicit_shutdown_traces" | sed 's/^/    /'
+			fi
+			if [[ -n "$log_file_traces" ]]; then
+				echo "  Stack traces during shutdown/reboot (log files):"
+				echo "$log_file_traces" | sed 's/^/    /'
+			fi
+			if [[ -n "$dmesg_reboot_traces" ]]; then
+				echo "  Stack traces during reboot (dmesg):"
+				echo "$dmesg_reboot_traces" | sed 's/^/    /'
+			fi
+		fi
+	fi
+
+	if [[ "$found_errors" == "true" ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+#** main
+#*
+main() {
+        # Trap for control-c
+        trap control_c SIGINT
+
+	# Parse arguments
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-v|--verbose)
+				b_verbose=true
+				shift
+				;;
+			-h|--help)
+				usage
+				exit 0
+				;;
+			*)
+				echo "Unknown option: $1" >&2
+				usage
+				exit 1
+				;;
+		esac
+	done
+
+	local last_boot=$(who -b | awk '{print $3,$4}')
+	local issues_found=false
+
+	# Check for crash dumps
+	if find /var/crash -type f -name vmcore -newermt "$last_boot" 2>/dev/null | grep -q .; then
+	    echo "[!] Crash detected since last boot."
+	    issues_found=true
+	fi
+
+	# Check for kernel stack traces
+	if check_kernel_logs "$last_boot"; then
+		echo "[!] Kernel stack traces detected since last boot."
+		issues_found=true
+	fi
+
+	# Check for shutdown errors
+	if check_shutdown_errors "$last_boot"; then
+		echo "[!] Shutdown errors detected."
+		issues_found=true
+	fi
+
+	if [[ "$issues_found" == "false" ]]; then
+		echo "[OK] Clean boot."
+	fi
+
+	exitme 0
+}
+
+main "$@"

@@ -1,0 +1,24 @@
+[Unit]
+Description=Capture shutdown kernel messages and stack traces
+DefaultDependencies=no
+# Run as late as possible, but before final-shutdown.target
+Before=final-shutdown.target shutdown.target reboot.target halt.target poweroff.target
+After=multi-user.target
+Conflicts=reboot.target halt.target poweroff.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/capture-shutdown
+StandardOutput=journal
+StandardError=journal
+# Longer timeout to allow reading /proc/kmsg during reboot sequence
+TimeoutSec=30
+# Don't kill the service immediately - let it finish reading /proc/kmsg
+KillMode=none
+# Send SIGTERM instead of SIGKILL to allow cleanup
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=shutdown.target
+

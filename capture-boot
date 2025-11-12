@@ -1,0 +1,86 @@
+#!/bin/bash
+# capture-boot: Capture dmesg immediately on boot to catch shutdown traces
+# This runs very early in boot before dmesg is cleared
+
+set -u  # Only fail on undefined variables, not on command failures
+
+# Pattern for critical kernel errors (excluding firmware bugs)
+# Match various BUG formats and warnings
+critical_pattern="(Call Trace:|Oops:|Kernel panic|kernel BUG|BUG at|BUG:|^[[:space:]]*BUG:|WARNING:|WARN_ON|WARN\(|RIP:|stack backtrace|general protection fault|page fault|NULL pointer dereference)"
+
+# Directory for saving traces
+trace_dir="/var/log/shutdown-traces"
+if ! mkdir -p "$trace_dir" 2>/dev/null; then
+	# Can't create directory, exit silently
+	exit 0
+fi
+
+# Capture dmesg immediately (before it's cleared)
+# Try multiple methods to capture kernel messages
+dmesg_output=$(dmesg -T 2>/dev/null || dmesg 2>/dev/null)
+
+# Also try reading from /dev/kmsg directly (kernel ring buffer)
+# This might contain messages that aren't in dmesg yet
+if [[ -r /dev/kmsg ]]; then
+	kmsg_output=$(timeout 1 cat /dev/kmsg 2>/dev/null | head -1000 || true)
+	if [[ -n "$kmsg_output" ]]; then
+		# Merge with dmesg output
+		dmesg_output="${dmesg_output}${dmesg_output:+$'\n'}${kmsg_output}"
+	fi
+fi
+
+if [[ -z "$dmesg_output" ]]; then
+	exit 0
+fi
+
+# Check for traces - save if ANY traces are found (not just near reboot messages)
+# This captures BUG traces that happen during shutdown/reboot
+has_traces=$(echo "$dmesg_output" | grep -iE "$critical_pattern" | grep -vE "\[Firmware Bug\]|Firmware Bug:" | head -1)
+has_reboot=$(echo "$dmesg_output" | grep -E "reboot: Restarting|reboot: machine restart|reboot:" | head -1)
+
+if [[ -n "$has_traces" ]]; then
+	# Found traces - save them
+	timestamp=$(date '+%Y%m%d-%H%M%S')
+	trace_file="$trace_dir/boot-capture-$timestamp.log"
+	
+	{
+		echo "=== Boot-time dmesg capture (traces detected) ==="
+		echo "Timestamp: $(date)"
+		echo "Boot ID: $(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo 'unknown')"
+		echo ""
+		
+		# Extract traces with context
+		echo "=== Critical traces detected ==="
+		echo "$dmesg_output" | awk -v pattern="$critical_pattern" '
+			{
+				lines[NR] = $0
+			}
+			END {
+				max_lines = NR
+				last_printed = 0
+				for (i = 1; i <= max_lines; i++) {
+					if (lines[i] ~ pattern && lines[i] !~ /\[Firmware Bug\]|Firmware Bug:/ && i > last_printed) {
+						# Show 100 lines of context around traces
+						start = (i - 50 > 1) ? i - 50 : 1
+						end = (i + 100 < max_lines) ? i + 100 : max_lines
+						for (j = start; j <= end; j++) {
+							print lines[j]
+						}
+						print "---"
+						last_printed = end
+					}
+				}
+			}
+		'
+		
+		echo ""
+		echo "=== Full dmesg output ==="
+		echo "$dmesg_output"
+	} > "$trace_file" 2>&1
+	
+	# Make it readable
+	chmod 644 "$trace_file" 2>/dev/null || true
+fi
+
+exit 0
+

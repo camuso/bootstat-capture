@@ -1,0 +1,18 @@
+[Unit]
+Description=Capture boot-time dmesg for shutdown traces
+DefaultDependencies=no
+# Run as early as possible, before most services
+After=sysinit.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/capture-boot
+StandardOutput=journal
+StandardError=journal
+TimeoutSec=5
+
+[Install]
+WantedBy=sysinit.target
+
