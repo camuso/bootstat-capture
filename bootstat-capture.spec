@@ -114,10 +114,23 @@ if [ $1 -eq 0 ]; then
     # Package is being removed (not upgraded)
     # Reload daemon first to ensure we have latest service definitions
     systemctl daemon-reload >/dev/null 2>&1 || :
-    # Stop services
-    systemctl stop capture-shutdown.service capture-boot.service >/dev/null 2>&1 || :
+    
+    # Stop services (ignore errors if already stopped)
+    systemctl stop capture-boot.service >/dev/null 2>&1 || :
+    systemctl stop capture-shutdown.service >/dev/null 2>&1 || :
+    
     # Disable services (removes symlinks from /etc/systemd/system/)
-    systemctl disable capture-shutdown.service capture-boot.service >/dev/null 2>&1 || :
+    # This must succeed to clean up properly
+    systemctl disable capture-boot.service capture-shutdown.service || :
+    
+    # Force remove any remaining symlinks or override files
+    rm -f /etc/systemd/system/capture-boot.service
+    rm -f /etc/systemd/system/capture-shutdown.service
+    rm -f /etc/systemd/system/sysinit.target.wants/capture-boot.service
+    rm -f /etc/systemd/system/shutdown.target.wants/capture-shutdown.service
+    
+    # Reload daemon after cleanup
+    systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 
 %postun
@@ -142,7 +155,7 @@ fi
 %dir %attr(755,root,root) /var/log/shutdown-traces
 
 %changelog
-* Wed Nov 12 2025 Tony Camuso <tcamuso@redhat.com> - 1.0-1
+* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - %{version}-%{release}
 - Initial package release
 - Includes bootstat, capture-shutdown, and capture-boot
 - Scripts installed to standard Fedora directories (%{_bindir})
