@@ -1,2 +1,3 @@
 rpmbuild/
-bootstat-capture-1.0.tar.gz
+bootstat-capture-*.tar.gz
+*.rpm
