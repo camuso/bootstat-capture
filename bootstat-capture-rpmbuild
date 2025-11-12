@@ -67,6 +67,25 @@ cp "${SCRIPT_DIR}/bootstat-capture.spec" "${RPMBUILD_DIR}/SPECS/"
 echo "Building RPM using local build directory..."
 rpmbuild --define "_topdir ${RPMBUILD_DIR}" -ba "${RPMBUILD_DIR}/SPECS/bootstat-capture.spec"
 
+# Find the built RPM files
+RPM_FILE=$(find "${RPMBUILD_DIR}/RPMS" -name "bootstat-capture-${VERSION}-*.noarch.rpm" -type f | head -1)
+SRPM_FILE=$(find "${RPMBUILD_DIR}/SRPMS" -name "bootstat-capture-${VERSION}-*.src.rpm" -type f | head -1)
+
+if [ -n "${RPM_FILE}" ]; then
+    # Copy RPM to script directory
+    echo ""
+    echo "Copying RPM to ${SCRIPT_DIR}/..."
+    cp "${RPM_FILE}" "${SCRIPT_DIR}/"
+    echo "RPM copied to: ${SCRIPT_DIR}/$(basename "${RPM_FILE}")"
+fi
+
+if [ -n "${SRPM_FILE}" ]; then
+    # Copy source RPM to script directory
+    echo "Copying source RPM to ${SCRIPT_DIR}/..."
+    cp "${SRPM_FILE}" "${SCRIPT_DIR}/"
+    echo "Source RPM copied to: ${SCRIPT_DIR}/$(basename "${SRPM_FILE}")"
+fi
+
 echo ""
 echo "RPM build complete!"
 echo "RPM location:"
@@ -76,4 +95,7 @@ echo ""
 echo "Source RPM location:"
 ls -lh "${RPMBUILD_DIR}/SRPMS/bootstat-capture-${VERSION}-"*.src.rpm 2>/dev/null || \
     find "${RPMBUILD_DIR}/SRPMS" -name "bootstat-capture-${VERSION}-*.src.rpm" -ls
+echo ""
+echo "RPM files copied to: ${SCRIPT_DIR}/"
+ls -lh "${SCRIPT_DIR}/bootstat-capture-${VERSION}-"*.rpm 2>/dev/null || echo "No RPM files found in script directory"
 
