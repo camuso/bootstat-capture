@@ -142,7 +142,7 @@ fi
 %dir %attr(755,root,root) /var/log/shutdown-traces
 
 %changelog
-* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - %{version}-%{release}
+* Wed Nov 12 2025 Tony Camuso <tcamuso@redhat.com> - 1.0-1
 - Initial package release
 - Includes bootstat, capture-shutdown, and capture-boot
 - Scripts installed to standard Fedora directories (%{_bindir})
