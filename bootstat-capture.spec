@@ -1,6 +1,6 @@
 %define name bootstat-capture
 %define version 1.0
-%define release 1%{?dist}
+%define release 2%{?dist}
 %define summary Boot status checker and shutdown trace capture tools
 %define license GPLv2+
 
@@ -114,21 +114,21 @@ if [ $1 -eq 0 ]; then
     # Package is being removed (not upgraded)
     # Reload daemon first to ensure we have latest service definitions
     systemctl daemon-reload >/dev/null 2>&1 || :
-    
+
     # Stop services (ignore errors if already stopped)
     systemctl stop capture-boot.service >/dev/null 2>&1 || :
     systemctl stop capture-shutdown.service >/dev/null 2>&1 || :
-    
+
     # Disable services (removes symlinks from /etc/systemd/system/)
     # This must succeed to clean up properly
     systemctl disable capture-boot.service capture-shutdown.service || :
-    
+
     # Force remove any remaining symlinks or override files
     rm -f /etc/systemd/system/capture-boot.service
     rm -f /etc/systemd/system/capture-shutdown.service
     rm -f /etc/systemd/system/sysinit.target.wants/capture-boot.service
     rm -f /etc/systemd/system/shutdown.target.wants/capture-shutdown.service
-    
+
     # Reload daemon after cleanup
     systemctl daemon-reload >/dev/null 2>&1 || :
 fi
@@ -144,6 +144,45 @@ else
     systemctl try-restart capture-boot.service >/dev/null 2>&1 || :
 fi
 
+%clean
+# Remove older RPM files from top directory and copy new ones from build directory
+# Get the top directory (parent of rpmbuild directory)
+BUILDDIR=%{_topdir}
+TOPDIR=$(dirname "$BUILDDIR" 2>/dev/null || pwd)
+
+# Find and copy binary RPMs
+if [ -d "${BUILDDIR}/RPMS" ]; then
+    for new_rpm in $(find "${BUILDDIR}/RPMS" -name "bootstat-capture-*.rpm" -type f); do
+        rpm_basename=$(basename "$new_rpm")
+        # Create pattern to match older versions: bootstat-capture-*.noarch.rpm or bootstat-capture-*.rpm
+        rpm_pattern="bootstat-capture-*.rpm"
+
+        # Remove older versions of this RPM from top directory
+        if [ -d "$TOPDIR" ]; then
+            for old_rpm in "$TOPDIR"/$rpm_pattern; do
+                if [ -f "$old_rpm" ] && [ "$(basename "$old_rpm")" != "$rpm_basename" ]; then
+                    echo "Removing older RPM: $(basename "$old_rpm")"
+                    rm -f "$old_rpm"
+                fi
+            done
+
+            # Copy new RPM to top directory
+            echo "Copying new RPM: $rpm_basename to $TOPDIR/"
+            cp -f "$new_rpm" "$TOPDIR/"
+        fi
+    done
+fi
+
+# Remove any existing .src.rpm files from top directory (we don't copy them)
+if [ -d "$TOPDIR" ]; then
+    for old_srpm in "$TOPDIR"/bootstat-capture-*.src.rpm; do
+        if [ -f "$old_srpm" ]; then
+            echo "Removing SRPM from top directory: $(basename "$old_srpm")"
+            rm -f "$old_srpm"
+        fi
+    done
+fi
+
 %files
 %defattr(-,root,root,-)
 %{_bindir}/bootstat
@@ -155,10 +194,13 @@ fi
 %dir %attr(755,root,root) /var/log/shutdown-traces
 
 %changelog
-* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - %{version}-%{release}
+* Nov 12 2025 Tony Camuso <tcamuso@redhat.com> - 1.0-2
+  Stop capture services on preun.
+  Only copy the rpm file, not src.rpm, to the top directory.
+
+* Nov 12 2025 Tony Camuso <tcamuso@redhat.com> - 1.0-1
 - Initial package release
 - Includes bootstat, capture-shutdown, and capture-boot
 - Scripts installed to standard Fedora directories (%{_bindir})
 - Includes systemd service files for automatic capture during shutdown and boot
 - Proper scriptlets for service management and log directory creation
-
